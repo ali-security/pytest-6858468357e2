@@ -1,4 +1,5 @@
 import os
+import shutil
 import stat
 import sys
 
@@ -430,3 +431,102 @@ def test_basetemp_with_read_only_files(testdir):
     # running a second time and ensure we don't crash
     result = testdir.runpytest("--basetemp=tmp")
     assert result.ret == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="checks unix permissions")
+def test_tmp_path_factory_create_directory_with_safe_permissions(
+    tmp_path, monkeypatch
+):
+    """Verify that pytest creates the pytest-of-foo directory with private
+    permissions."""
+    from _pytest.tmpdir import TempPathFactory
+
+    # Use the test's tmp_path as the system temproot (/tmp).
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(tmp_path))
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    basetemp = tmp_factory.getbasetemp()
+
+    # The parent (pytest-of-foo) is private.
+    assert (os.stat(str(basetemp.parent)).st_mode & 0o077) == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="checks unix permissions")
+def test_tmp_path_factory_fixes_up_world_readable_permissions(tmp_path, monkeypatch):
+    """Verify that if a /tmp/pytest-of-foo directory already exists with
+    world-readable permissions, it is fixed.
+
+    pytest used to mkdir with such permissions, that's why we fix it up.
+    """
+    from _pytest.tmpdir import TempPathFactory
+
+    # Use the test's tmp_path as the system temproot (/tmp).
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(tmp_path))
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    basetemp = tmp_factory.getbasetemp()
+
+    # Before - simulate bad perms.
+    os.chmod(str(basetemp.parent), 0o777)
+    assert (os.stat(str(basetemp.parent)).st_mode & 0o077) != 0
+
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    basetemp = tmp_factory.getbasetemp()
+
+    # After - fixed.
+    assert (os.stat(str(basetemp.parent)).st_mode & 0o077) == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "getuid"), reason="checks unix permissions")
+def test_tmp_path_factory_rejects_directory_not_owned_by_user(tmp_path, monkeypatch):
+    """Verify that if a /tmp/pytest-of-foo directory already exists and is
+    owned by another user, it is rejected (CVE-2025-71176)."""
+    from _pytest.tmpdir import TempPathFactory
+
+    # Use the test's tmp_path as the system temproot (/tmp).
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(tmp_path))
+
+    # First create the pytest-of-user directory, owned by us.
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    pytest_of_user = tmp_factory.getbasetemp().parent
+    owner_uid = os.stat(str(pytest_of_user)).st_uid
+
+    # Now pretend to be another user, for whom the existing directory was
+    # pre-created by someone else.
+    monkeypatch.setattr(os, "getuid", lambda: owner_uid + 1)
+
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    with pytest.raises(
+        OSError, match=r"temporary directory .* is not owned by the current user"
+    ):
+        tmp_factory.getbasetemp()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "getuid") or os.stat not in os.supports_follow_symlinks,
+    reason="checks unix permissions and symlinks",
+)
+def test_tmp_path_factory_doesnt_follow_symlinks(tmp_path, monkeypatch):
+    """Verify that if a /tmp/pytest-of-foo directory is a symbolic link,
+    it is rejected (#13669, CVE-2025-71176)."""
+    from _pytest.tmpdir import TempPathFactory
+
+    attacker_controlled = tmp_path / "attacker_controlled"
+    attacker_controlled.mkdir()
+
+    # Use the test's tmp_path as the system temproot (/tmp).
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(tmp_path))
+
+    # First just get the pytest-of-user path.
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    pytest_of_user = tmp_factory.getbasetemp().parent
+    # Just for safety in the test, before we nuke it.
+    assert "pytest-of-" in str(pytest_of_user)
+    shutil.rmtree(str(pytest_of_user))
+
+    pytest_of_user.symlink_to(attacker_controlled)
+
+    # This now tries to use the directory when it's a symlink.
+    tmp_factory = TempPathFactory(None, lambda *args: None)
+    with pytest.raises(OSError, match=r"temporary directory .* is a symbolic link"):
+        tmp_factory.getbasetemp()
+    # Nothing was created in the attacker-controlled directory.
+    assert list(attacker_controlled.iterdir()) == []

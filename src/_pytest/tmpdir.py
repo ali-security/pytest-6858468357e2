@@ -1,6 +1,7 @@
 """ support for providing temporary directories to test functions.  """
 import os
 import re
+import stat
 import tempfile
 
 import attr
@@ -68,7 +69,57 @@ class TempPathFactory:
             # use a sub-directory in the temproot to speed-up
             # make_numbered_dir() call
             rootdir = temproot.joinpath("pytest-of-{}".format(user))
-            rootdir.mkdir(exist_ok=True)
+            rootdir.mkdir(mode=0o700, exist_ok=True)
+            # Because we use exist_ok=True with a predictable name, make sure
+            # we are the owners, to prevent any funny business (on unix, where
+            # temproot is usually shared).
+            # Also, to keep things private, fixup any world-readable temp
+            # rootdir's permissions. Historically 0o755 was used, so we can't
+            # just error out on this, at least for a while.
+            # Don't follow symlinks, otherwise we're open to symlink-swapping
+            # TOCTOU vulnerability.
+            # This check makes us vulnerable to a DoS - a user can `mkdir
+            # /tmp/pytest-of-otheruser` and then `otheruser` will fail this
+            # check. For now we don't consider it a real problem. otheruser can
+            # change their TMPDIR or --basetemp, and maybe give the prankster a
+            # good scolding.
+            if hasattr(os, "getuid"):
+                uid = os.getuid()
+                # getuid shouldn't fail, but cpython defines such a case.
+                # Let's hope for the best.
+                if uid != -1:
+                    stat_follow_symlinks = (
+                        False if os.stat in os.supports_follow_symlinks else True
+                    )
+                    rootdir_stat = os.stat(
+                        str(rootdir), follow_symlinks=stat_follow_symlinks
+                    )
+                    if stat.S_ISLNK(rootdir_stat.st_mode):
+                        raise OSError(
+                            "The temporary directory {} is a symbolic link. "
+                            "Fix this and try again.".format(rootdir)
+                        )
+                    if rootdir_stat.st_uid != uid:
+                        raise OSError(
+                            "The temporary directory {} is not owned by the "
+                            "current user. Fix this and try again.".format(rootdir)
+                        )
+                    if (rootdir_stat.st_mode & 0o077) != 0:
+                        chmod_follow_symlinks = (
+                            False if os.chmod in os.supports_follow_symlinks else True
+                        )
+                        try:
+                            os.chmod(
+                                str(rootdir),
+                                rootdir_stat.st_mode & ~0o077,
+                                follow_symlinks=chmod_follow_symlinks,
+                            )
+                        except NotImplementedError:
+                            # Some platforms (e.g. PyPy on Linux) advertise
+                            # follow_symlinks support for chmod without actually
+                            # implementing it; rootdir was already verified not
+                            # to be a symbolic link above.
+                            os.chmod(str(rootdir), rootdir_stat.st_mode & ~0o077)
             basetemp = make_numbered_dir_with_cleanup(
                 prefix="pytest-", root=rootdir, keep=3, lock_timeout=LOCK_TIMEOUT
             )
