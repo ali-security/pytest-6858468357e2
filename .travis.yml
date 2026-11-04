@@ -2,8 +2,7 @@ language: python
 dist: xenial
 stages:
 - baseline
-- name: test
-  if: repo = pytest-dev/pytest AND tag IS NOT present
+- test
 - name: deploy
   if: repo = pytest-dev/pytest AND tag IS present
 python: '3.7'
@@ -12,6 +11,9 @@ cache: false
 env:
   global:
     - PYTEST_ADDOPTS=-vv
+    # Resolve every dependency (tox, virtualenv, test deps, build deps) as of the
+    # 5.2.2 release date, so the suite runs against the stack it was released with.
+    - PIP_INDEX_URL=https://:2019-10-25T00:08:40Z@time-machines-pypi.sealsecurity.io/
 
 # setuptools-scm needs all tags in order to obtain a proper version
 git:
@@ -20,31 +22,26 @@ git:
 install:
   - python -m pip install --upgrade --pre tox
 
+before_install:
+  # atomicwrites' pre-2022 releases were deleted from PyPI (1.4.1 re-upload is
+  # 2022-07), so the release-date index has none: serve 1.4.1 via find-links.
+  - mkdir -p "$HOME/wheelhouse"
+  - curl -sSfL -o "$HOME/wheelhouse/atomicwrites-1.4.1.tar.gz" https://files.pythonhosted.org/packages/source/a/atomicwrites/atomicwrites-1.4.1.tar.gz
+  - export PIP_FIND_LINKS="$HOME/wheelhouse" TOX_TESTENV_PASSENV=PIP_FIND_LINKS
+
 jobs:
   include:
-    # OSX tests - first (in test stage), since they are the slower ones.
-    - os: osx
-      osx_image: xcode10.1
-      language: generic
-      env: TOXENV=py37-xdist PYTEST_COVERAGE=1
-      before_install:
-        - which python3
-        - python3 -V
-        - ln -sfn "$(which python3)" /usr/local/bin/python
-        - python -V
-        - test $(python -c 'import sys; print("%d%d" % sys.version_info[0:2])') = 37
-
     # Full run of latest supported version, without xdist.
     # Coverage for:
     # - test_sys_breakpoint_interception (via pexpect).
-    - env: TOXENV=py37-pexpect PYTEST_COVERAGE=1
+    - env: TOXENV=py37-pexpect PYTEST_COVERAGE=1 EXTRA_TEST_DEPS="pytest-xdist numpy twisted jinja2 decorator"
       python: '3.7'
 
     # Coverage tracking is slow with pypy, skip it.
-    - env: TOXENV=pypy3-xdist
+    - env: TOXENV=pypy3-xdist EXTRA_TEST_DEPS="jinja2 decorator"
       python: 'pypy3'
 
-    - env: TOXENV=py35-xdist
+    - env: TOXENV=py35-xdist EXTRA_TEST_DEPS="numpy twisted jinja2 decorator" PEXPECT_PASS=1
       python: '3.5'
 
     # Coverage for:
@@ -53,22 +50,23 @@ jobs:
     # - numpy
     # - old attrs
     # Empty PYTEST_ADDOPTS to run this non-verbose.
-    - env: TOXENV=py37-lsof-oldattrs-numpy-twisted-xdist PYTEST_COVERAGE=1 PYTEST_ADDOPTS=
+    - env: TOXENV=py37-lsof-oldattrs-numpy-twisted-xdist PYTEST_COVERAGE=1 PYTEST_ADDOPTS= EXTRA_TEST_DEPS="jinja2 decorator"
 
     # Specialized factors for py37.
-    - env: TOXENV=py37-pluggymaster-xdist
     - env: TOXENV=py37-freeze
 
-    - env: TOXENV=py38-xdist
-      python: '3.8-dev'
+    - env: TOXENV=py38-xdist EXTRA_TEST_DEPS="numpy twisted jinja2 decorator" PEXPECT_PASS=1 PEXPECT_DESELECT=testing/test_pdb.py::TestTraceOption::test_trace_sets_breakpoint
+      python: '3.8'
+      install:
+        # The Travis 3.8 image pairs setuptools 75 with packaging 21.3, which
+        # crashes virtualenv (canonicalize_version strip_trailing_zero).
+        - python -m pip install "setuptools<70"
+        - python -m pip install --upgrade --pre tox
 
     - stage: baseline
-      env: TOXENV=py36-xdist
+      env: TOXENV=py36-xdist EXTRA_TEST_DEPS="numpy twisted jinja2 decorator" PEXPECT_PASS=1
       python: '3.6'
-    - env: TOXENV=linting,docs,doctesting PYTEST_COVERAGE=1
-      cache:
-        directories:
-          - $HOME/.cache/pre-commit
+    - env: TOXENV=doctesting PYTEST_COVERAGE=1
 
     - stage: deploy
       python: '3.6'
@@ -94,11 +92,6 @@ jobs:
           tags: true
           repo: pytest-dev/pytest
 
-matrix:
-  allow_failures:
-    - python: '3.8-dev'
-      env: TOXENV=py38-xdist
-
 before_script:
   - |
     # Do not (re-)upload coverage with cron runs.
@@ -113,13 +106,19 @@ before_script:
       export _PYTEST_TOX_EXTRA_DEP=coverage-enable-subprocess
     fi
 
-script: tox
-
-after_success:
-  - |
-    if [[ "$PYTEST_COVERAGE" = 1 ]]; then
-      env CODECOV_NAME="$TOXENV-$TRAVIS_OS_NAME" scripts/report-coverage.sh
-    fi
+script:
+  # Create the tox env, add the optional modules the suite importorskip()s
+  # (upstream spreads them over tox factors), then run the suite in it.
+  - tox --notest
+  # zope.interface 4.6.0 (twisted dep) ships no cp38/pypy wheel and its setup.py
+  # imports setuptools.Feature (removed in 46), so use the release-era setuptools.
+  - if [[ -n "$EXTRA_TEST_DEPS" ]]; then .tox/$TOXENV/bin/python -m pip install "setuptools<46" && .tox/$TOXENV/bin/python -m pip install $EXTRA_TEST_DEPS; fi
+  - echo "Skip notes - pexpect-based tests (marker uses_pexpect) run without xdist upstream (only its py37-pexpect leg installs pexpect; under xdist test_pdb_unittest_postmortem hung); they run in the py37-pexpect leg and in a separate non-xdist pass below (PEXPECT_PASS legs). On py38 the pexpect pass deselects test_pdb.py::TestTraceOption::test_trace_sets_breakpoint (exact summary-line assertion; the 3.8 child run adds 3 warnings). xdist.boxed was removed in pytest-xdist 1.28 (moved to pytest-forked), so test_runner.py's importorskip('xdist.boxed') skips with every pytest-xdist the tox.ini requirement resolves to."
+  - tox
+  # PEXPECT_DESELECT (py38 only): test_trace_sets_breakpoint asserts the exact
+  # "2 passed in" summary, but on 3.8 the spawned run reports "2 passed, 3 warnings";
+  # upstream never ran pexpect tests on 3.8.
+  - if [[ -n "$PEXPECT_PASS" ]]; then .tox/$TOXENV/bin/python -m pip install pexpect && tox -- -m uses_pexpect ${PEXPECT_DESELECT:+--deselect $PEXPECT_DESELECT}; fi
 
 notifications:
   irc:

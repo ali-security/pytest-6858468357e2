@@ -1,0 +1,41 @@
+name: seal-build
+
+# Build-and-pack only: the test suite runs on Travis (.travis.yml).
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      SETUPTOOLS_SCM_PRETEND_VERSION: "5.2.2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.7"
+      - name: Install build toolchain
+        # Resolve the build toolchain as of the 5.2.2 release date (upstream deploy
+        # stage: `pip install -U setuptools setuptools_scm` then sdist bdist_wheel);
+        # explicit pins so the runner's newer preinstalled setuptools is replaced.
+        # Scoped to this step: setup-python's own pip upgrade must not see it.
+        env:
+          PIP_INDEX_URL: "https://:2019-10-25T00:08:40Z@time-machines-pypi.sealsecurity.io/"
+        run: python -m pip install "setuptools==41.4.0" "setuptools_scm==3.3.3" "wheel==0.33.6"
+      - name: Prepare pack tree
+        # setuptools-scm puts every git-tracked file in the sdist: keep this
+        # workflow out of it and ship the release's own .travis.yml.
+        run: |
+          git checkout 5.2.2 -- .travis.yml
+          git rm -q --cached .github/workflows/seal-build.yml
+          git -c user.name=seal -c user.email=seal@localhost commit -q -m "pack tree"
+      - name: Build sdist and wheel
+        run: python setup.py sdist bdist_wheel
+      - run: ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
